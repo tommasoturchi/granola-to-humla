@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Never commit real data: Granola exports and Humla databases hold meeting content.
+*.csv
+*.sqlite
+*.sqlite-*
+notes.sqlite.before-granola-import-*

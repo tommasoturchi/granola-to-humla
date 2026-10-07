@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "granola-to-humla"
+dynamic = ["version"]
+description = "Import a Granola CSV export into the Humla meeting-notes app"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Tommaso Turchi" }]
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/tommasoturchi/granola-to-humla"
+
+[project.scripts]
+granola-to-humla = "granola_to_humla:main"
+
+[tool.setuptools]
+py-modules = ["granola_to_humla"]
+
+[tool.setuptools.dynamic]
+version = { attr = "granola_to_humla.__version__" }
