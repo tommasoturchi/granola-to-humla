@@ -61,6 +61,57 @@ class MarkdownToTiptap(unittest.TestCase):
         self.assertEqual(g.markdown_to_tiptap("line one\nline two"), "<p>line one<br>line two</p>")
 
 
+# Made-up speech in each supported language.
+SAMPLES = {
+    "en": "Okay so I think the main thing is that we just need to know what they want, because "
+          "it's not really clear yet. Yeah, and there would be something about the budget that "
+          "we should look at, which I can't really decide alone.",
+    "it": "Allora, quindi il punto è che non abbiamo ancora deciso. Però magari possiamo fare "
+          "così: questo lo vediamo dopo, perché adesso è molto più importante capire cosa "
+          "vogliono gli studenti, cioè anche dove mettere le domande.",
+    "es": "Bueno, pues yo creo que el problema es que todavía no está claro. Entonces, cuando "
+          "hay tiempo, podemos hacer esto también, porque ahora es muy importante entender lo "
+          "que quieren los usuarios y las empresas.",
+    "fr": "Alors voilà, je pense que le problème c'est que nous ne savons pas encore. Donc il "
+          "faut faire une liste des points, parce que ça peut aussi changer, et elle est très "
+          "importante pour vous et pour les autres dans le projet.",
+    "de": "Also ich denke, das Problem ist, dass wir noch nicht wissen, wie das genau aussieht. "
+          "Aber wenn wir jetzt schon eine Liste haben, dann ist das sehr gut, und die anderen "
+          "sind auch dabei, oder? Ich bin mir nicht sicher.",
+    "pt": "Então, eu acho que o problema é que ainda não está claro. Mas você sabe, isso é muito "
+          "importante para nós, e ela também tem uma ideia boa. Foi bem aqui que começamos, "
+          "na reunião, e ele quer fazer isto com os outros.",
+    "nl": "Nou, ik denk dat het probleem is dat we het nog niet weten. Maar je moet wel heel "
+          "goed kijken, want dan zijn we eigenlijk ook klaar. Dus we hebben gewoon een lijst "
+          "nodig van alle punten voor de vergadering.",
+    "sv": "Jag tror att problemet är att vi inte vet ännu. Men det är väldigt viktigt att göra "
+          "en lista, och vad vi ska göra också. Hur har det varit där? Det är riktigt bra att "
+          "du kom, och vi ska ses igen.",
+    "no": "Jeg tror kanskje at problemet er at vi ikke vet det ennå. Men det er veldig viktig "
+          "å gjøre litt mer, og hva vi skal gjøre nå. Det ble mye snakk om noe sånn, og det har "
+          "vært riktig bra.",
+    "da": "Jeg tror måske at problemet er at vi ikke ved det endnu. Men det er meget vigtigt at "
+          "gøre lidt mere, og hvad vi skal gøre nu. Det blev noget snak om sådan noget, og det "
+          "har været rigtig godt.",
+}
+
+
+class LanguageDetection(unittest.TestCase):
+    def test_each_supported_language_is_recognised(self):
+        for lang, text in SAMPLES.items():
+            with self.subTest(lang=lang):
+                self.assertEqual(g.detect_language(" ".join([text] * 3)), lang)
+
+    def test_unclear_text_gets_no_language(self):
+        self.assertIsNone(g.detect_language(SAMPLES["it"]))  # too short
+        self.assertIsNone(g.detect_language(" ".join([SAMPLES["it"], SAMPLES["en"]] * 3)))  # mixed
+        self.assertIsNone(g.detect_language(""))
+
+    def test_markers_belong_to_one_language_only(self):
+        for word in ("de", "la", "en", "non", "il", "con", "ikke", "jeg"):
+            self.assertNotIn(word, g.LANGUAGE_MARKERS)
+
+
 class Fields(unittest.TestCase):
     def test_timestamps(self):
         self.assertEqual(g.parse_created("2026-09-14T14:28:28.349Z"), 1789396108349)
@@ -68,6 +119,7 @@ class Fields(unittest.TestCase):
         self.assertEqual(g.parse_created("2026-09-14T14:28:28Z"), 1789396108000)
 
     def test_language_option(self):
+        self.assertEqual(g.parse_language("detect"), "detect")
         self.assertEqual(g.parse_language("auto"), "auto")
         self.assertEqual(g.parse_language(" EN "), "en")
         self.assertEqual(g.parse_language("yue"), "yue")
@@ -117,6 +169,7 @@ class EndToEnd(unittest.TestCase):
             w.writerow(["document_id", "user_email", "document_title", "workspace_name", "document_created", "summary", "notes", "transcript"])
             w.writerow(["d1", "a@b.c", "Standup", "Personal", "2026-01-02T09:00:00.000Z", "## Done\n\n- shipped", "- send the slides", "Hello.\nHi there."])
             w.writerow(["d2", "a@b.c", "Review", "Personal", "2026-01-03T09:00:00.000Z", "## Notes\n\n- fine", "", "Okay."])
+            w.writerow(["d3", "a@b.c", "Planning", "Personal", "2026-01-04T09:00:00.000Z", "## Plan", "", "\n".join([SAMPLES["en"]] * 3)])
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -141,13 +194,16 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(n["workspace_id"], "")
         self.assertIsNotNone(n["folder_id"])
         self.assertEqual(self.rows()["Review"]["body"], "")
-        self.assertEqual(n["language"], "auto")
+        self.assertEqual(n["language"], "auto")  # too little text to tell
+        self.assertEqual(self.rows()["Planning"]["language"], "en")
 
     def test_language_can_be_set_and_refreshed(self):
         self.run_import("--language", "en")
         self.assertEqual(self.rows()["Standup"]["language"], "en")
         self.run_import("--update", "--language", "default")
         self.assertEqual(self.rows()["Standup"]["language"], "")
+        self.run_import("--update", "--language", "auto")
+        self.assertEqual(self.rows()["Planning"]["language"], "auto")
 
     def test_rerun_is_a_no_op_and_update_spares_edited_notes(self):
         self.run_import()
@@ -156,7 +212,7 @@ class EndToEnd(unittest.TestCase):
         conn.commit()
         conn.close()
         self.run_import()
-        self.assertEqual(len(self.rows()), 2)
+        self.assertEqual(len(self.rows()), 3)
         self.run_import("--update")
         self.assertEqual(self.rows()["Standup"]["body"], "<p>mine</p>")
         self.run_import("--update", "--overwrite-edited")

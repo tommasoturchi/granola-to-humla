@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+.DS_Store
 
 # Never commit real data: Granola exports and Humla databases hold meeting content.
 *.csv

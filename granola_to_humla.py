@@ -11,7 +11,7 @@ Each Granola document becomes one Humla Note:
     summary            summary              Markdown (what Humla's summary view renders)
     document_created   created_at           epoch milliseconds
                        updated_at           = created_at, so notes sort by meeting date
-                       language             "auto" unless --language says otherwise
+                       language             detected from the transcript (see --language)
 
 The transcript is imported exactly as Granola exported it. Imported notes have
 a transcript but no recording session and no timeline, which is the shape
@@ -35,10 +35,12 @@ Usage:
     python3 granola_to_humla.py granola-export.csv --update
     python3 granola_to_humla.py granola-export.csv --language en
 
-The note language only decides what language Humla writes in when you press
-Summarize on an imported note, or ask it for a new title. The default, "auto",
-answers in the transcript's own language, which suits a library that mixes
-languages. Humla's app-wide language is Norwegian unless you chose another during
+Each note's language is detected from its transcript by counting common
+function words (see detect_language); a transcript that is short, mixed or in
+a language the lists don't cover gets "auto". Humla writes in that language
+when you press Summarize on an imported note or ask it for a new title, and
+its MCP server reports it so a connected agent knows which language to search
+in. Humla's app-wide language is Norwegian unless you chose another during
 setup or in Settings, which is why the script doesn't leave it to that setting.
 
 Re-running is safe. Note ids are derived from Granola's document_id, so a
@@ -169,6 +171,71 @@ def clean_summary(text: str, strip_granola_link: bool) -> str:
 
 def note_id_for(document_id: str) -> str:
     return str(uuid.uuid5(GRANOLA_NAMESPACE, "granola:" + document_id.strip()))
+
+
+# --------------------------------------------------------------------------
+# Language detection (--language detect, the default)
+#
+# Counts common function words per language. Only words that belong to a
+# single language's list count, so "de", "la" or "en", which several
+# languages share, never tip the balance; that is also what separates
+# Norwegian from Danish ("hva", "litt", "mye" against "hvad", "lidt",
+# "meget"). Codes are the ones Humla's language picker uses.
+#
+# A note gets a language only when the evidence is clear: at least
+# DETECT_MIN_HITS marker words, at least DETECT_MIN_SHARE of them from one
+# language. Short, mixed or unlisted-language transcripts stay on "auto".
+# --------------------------------------------------------------------------
+
+_FUNCTION_WORDS = {
+    "en": "the and that this with have but not they what just about know think yeah there would "
+          "because don't it's i'm we're you're can't should could which their been were "
+          "really something actually also",
+    "it": "il che non per sono della del anche questo questa quindi perché però cioè allora gli "
+          "una più poi ho hai abbiamo fare molto tutto essere cosa dove nel alla delle dei ci "
+          "magari comunque adesso ancora le qui",
+    "es": "el los las pero porque para por está muy también esto eso cuando hay pues "
+          "entonces bueno yo creo puede hacer sólo ahora del una cosa",
+    "fr": "le les des est une pas je vous nous qui dans pour avec sur mais c'est ça donc voilà "
+          "très aussi elle ils au aux du peut fait faire il non",
+    "de": "der die das und ist nicht ich sie ein eine zu den mit auf für auch dass wir aber noch "
+          "sehr oder wenn wie haben sind schon jetzt du also",
+    "pt": "os não uma para com mas você isso isto então também eu ele ela muito tem na ao foi "
+          "bem aqui fazer das",
+    "nl": "het een van dat niet ik je op voor maar ook dan zijn nog wel heel dus hebben gewoon "
+          "eigenlijk nu",
+    "sv": "och att är inte jag ett ska vad hur också där väldigt göra varit riktigt den nu",
+    "no": "ikke jeg hva kanskje litt mye noe ble sånn veldig gjøre vært riktig nå",
+    "da": "ikke jeg hvad måske lidt meget noget blev sådan rigtig gøre været nu",
+}
+
+
+def _marker_words() -> dict[str, str]:
+    seen: dict[str, set[str]] = {}
+    for lang, words in _FUNCTION_WORDS.items():
+        for word in words.split():
+            seen.setdefault(word, set()).add(lang)
+    return {word: langs.pop() for word, langs in seen.items() if len(langs) == 1}
+
+
+LANGUAGE_MARKERS = _marker_words()
+DETECT_MIN_HITS = 20
+DETECT_MIN_SHARE = 0.75
+_WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+
+
+def detect_language(text: str) -> str | None:
+    """The language code of `text`, or None when the evidence isn't clear."""
+    hits: dict[str, int] = {}
+    for word in _WORD_RE.findall(text.lower().replace("’", "'")):
+        lang = LANGUAGE_MARKERS.get(word)
+        if lang:
+            hits[lang] = hits.get(lang, 0) + 1
+    total = sum(hits.values())
+    if total < DETECT_MIN_HITS:
+        return None
+    lang, top = max(hits.items(), key=lambda kv: kv[1])
+    return lang if top / total >= DETECT_MIN_SHARE else None
 
 
 # --------------------------------------------------------------------------
@@ -498,7 +565,7 @@ def drop_derived_index(conn: sqlite3.Connection, note_id: str) -> None:
 
 def build_note(row: dict[str, str], args) -> dict:
     created = parse_created(row["document_created"])
-    return {
+    note = {
         "id": note_id_for(row["document_id"]),
         "title": " ".join((row.get("document_title") or "").split()),
         "body": markdown_to_tiptap(row.get("notes") or ""),
@@ -506,24 +573,38 @@ def build_note(row: dict[str, str], args) -> dict:
         "summary": clean_summary(row.get("summary") or "", args.strip_granola_links),
         "created_at": created,
         "updated_at": created,
+        "language": args.language,
     }
+    if args.language == "detect":
+        # The transcript is what was said. Granola sometimes writes the summary
+        # in another language, so it only stands in when there is no transcript.
+        text = note["transcript"] or "\n".join((row.get("summary") or "", row.get("notes") or ""))
+        note["language"] = detect_language(text) or "auto"
+    return note
 
 
 def parse_language(value: str) -> str:
-    """--language: "auto", "default" (stored as "", Humla's own fallback to the
-    app-wide language setting), or a language code as Humla's picker uses them
-    (ISO 639-1, plus a few three-letter Whisper codes such as "haw" and "yue")."""
+    """--language: "detect" (per note, see detect_language), "auto", "default"
+    (stored as "", Humla's own fallback to the app-wide language setting), or a
+    language code as Humla's picker uses them (ISO 639-1, plus a few
+    three-letter Whisper codes such as "haw" and "yue")."""
     code = value.strip().lower()
     if code == "default":
         return ""
-    if code == "auto" or re.fullmatch(r"[a-z]{2,3}", code):
+    if code in ("detect", "auto") or re.fullmatch(r"[a-z]{2,3}", code):
         return code
     raise argparse.ArgumentTypeError(
-        f"{value!r}: use auto, default, or a language code such as en or it"
+        f"{value!r}: use detect, auto, default, or a language code such as en or it"
     )
 
 
-def describe_language(code: str) -> str:
+def describe_language(code: str, notes: list[dict]) -> str:
+    if code == "detect":
+        counts: dict[str, int] = {}
+        for n in notes:
+            counts[n["language"]] = counts.get(n["language"], 0) + 1
+        parts = ", ".join(f"{lang} {k}" for lang, k in sorted(counts.items(), key=lambda kv: -kv[1]))
+        return f"detected per note ({parts})" if parts else "detected per note"
     if code == "auto":
         return "auto-detect"
     return code or "Humla's default language setting"
@@ -590,7 +671,7 @@ def run(args) -> int:
     elif skipped_present:
         print(f"  already imported:     {len(skipped_present)} (skipped; --update refreshes them)")
     print(f"  with your own notes:  {with_body}")
-    print(f"  note language:        {describe_language(args.language)}")
+    print(f"  note language:        {describe_language(args.language, to_insert + to_update)}")
     for msg in bad:
         print(f"  skipped, bad date:    {msg}")
 
@@ -600,7 +681,8 @@ def run(args) -> int:
             when = dt.datetime.fromtimestamp(n["created_at"] / 1000).strftime("%Y-%m-%d %H:%M")
             print(
                 f"  {when}  {n['title'][:48]:<48}  transcript {len(n['transcript'].splitlines()):>5} lines"
-                f"  summary {len(n['summary']):>5} chars  notes {'yes' if n['body'] else 'no'}"
+                f"  summary {len(n['summary']):>5} chars  notes {'yes' if n['body'] else 'no':<3}"
+                f"  language {n['language'] or 'default'}"
             )
         conn.close()
         return 0
@@ -619,9 +701,6 @@ def run(args) -> int:
     optional_defaults = {
         "audio_path": None,
         "summary_preset": summary_preset,
-        # What Humla writes summaries and titles in. "auto" answers in the
-        # transcript's own language; "" follows the app-wide setting.
-        "language": args.language,
         "summary_provider": "",
         "expected_speakers": None,
         "owner": "",
@@ -642,6 +721,8 @@ def run(args) -> int:
 
             for n in to_insert:
                 values = dict(n)
+                if "language" not in cols:
+                    del values["language"]
                 for col, default in optional_defaults.items():
                     if col in cols:
                         values[col] = default
@@ -660,7 +741,7 @@ def run(args) -> int:
                     (n["title"], n["body"], n["transcript"], n["summary"], n["created_at"], n["updated_at"], n["id"]),
                 )
                 if "language" in cols:
-                    conn.execute("UPDATE notes SET language = ? WHERE id = ?", (args.language, n["id"]))
+                    conn.execute("UPDATE notes SET language = ? WHERE id = ?", (n["language"], n["id"]))
                 drop_derived_index(conn, n["id"])
                 if folder_id and "folder_id" in cols:
                     conn.execute("UPDATE notes SET folder_id = ? WHERE id = ? AND folder_id IS NULL", (folder_id, n["id"]))
@@ -695,10 +776,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--language",
         type=parse_language,
-        default="auto",
+        default="detect",
         metavar="CODE",
-        help="language Humla writes these notes' summaries and titles in: auto (default; "
-        "follows each transcript), a code such as en or it, or default (Humla's own setting)",
+        help="each note's language: detect (default; from its transcript, auto when unclear), "
+        "auto, a code such as en or it, or default (Humla's own setting)",
     )
     parser.add_argument("--limit", type=int, metavar="N", help="import only the first N documents (for a trial run)")
     parser.add_argument("--no-backup", action="store_true", help="skip the database backup")

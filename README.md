@@ -50,7 +50,7 @@ Before writing anything the script saves a consistent copy of the database next 
 | `summary` (AI notes) | summary | Markdown, unchanged |
 | `transcript` | transcript | plain text, one utterance per line, unchanged |
 | `document_created` | created and updated time | epoch milliseconds |
-| (none) | note language | `auto`, or what `--language` says |
+| (detected) | note language | the transcript's language, such as `it` or `en`, or `auto` when unclear (see `--language`) |
 
 `user_email` and `workspace_name` are not used. Notes land in your Personal space, which in Humla is local-only.
 
@@ -64,7 +64,7 @@ Granola's notes are Markdown; the script converts headings, nested bullet and nu
 | `--folder NAME` | File imported notes in this Humla folder, created if it doesn't exist. |
 | `--update` | Refresh notes from an earlier import with the CSV's content. Notes you have edited in Humla since importing are left alone. |
 | `--overwrite-edited` | With `--update`, overwrite those edited notes too. |
-| `--language CODE` | The language Humla writes in when you press Summarize on an imported note, or ask it for a new title. `auto` (the default) answers in each transcript's own language. Use a code such as `en` or `it` to fix one language, or `default` to follow Humla's app-wide setting. |
+| `--language CODE` | Each note's language. `detect` (the default) reads it from the transcript, see below. `auto` leaves every note on Humla's auto-detect, a code such as `en` or `it` gives all of them that language, and `default` follows Humla's app-wide setting. |
 | `--strip-granola-links` | Remove the "Chat with meeting transcript: <granola link>" footer Granola appends to every summary. Kept by default. |
 | `--limit N` | Import only the first N documents, for a trial. |
 | `--data-dir PATH` | Humla's data folder. Default: `~/Library/Application Support/no.humla.app`. |
@@ -80,7 +80,9 @@ Humla normally builds a note's transcript from per-recording timelines with spea
 
 Search chunks, the speaker list and embeddings are derived data that Humla maintains itself. At startup it indexes every note that has no chunks yet, then embeds them with whatever embedding provider you have configured. The importer leaves all of that to Humla instead of reimplementing its chunker. If your chat provider is OpenAI, the first launch after the import sends the imported text through `text-embedding-3-small` once, on your API key.
 
-Humla's app-wide language is Norwegian unless you picked another during setup or in Settings, which is why imported notes get their own language (`auto`) instead of following that setting. The language doesn't change the imported text; it only decides what Humla writes in later.
+Each note's language is detected from its transcript, by counting common function words in English, Italian, Spanish, French, German, Portuguese, Dutch, Swedish, Norwegian and Danish. Only words that belong to one of those languages count, so a word like `de` or `la` that several of them share never tips the balance. A note gets a language when at least 20 such words turn up and three quarters of them point the same way; a transcript that is short, mixed or in another language stays on `auto`. In a test export of 226 meetings that gave 120 Italian, 103 English and 3 mixed.
+
+The language doesn't change the imported text. Humla writes in it when you press Summarize on an imported note or ask for a new title, and its MCP server reports it, so a connected agent knows which language to search in. Humla's app-wide language is Norwegian unless you picked another during setup or in Settings, which is why imported notes get their own language instead of following that setting.
 
 Each note's updated time is set to the meeting date, so imported meetings sort by date in Humla's lists instead of all appearing under today.
 
