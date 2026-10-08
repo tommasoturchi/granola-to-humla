@@ -13,7 +13,7 @@ This is an independent project, not affiliated with Granola or Humla.
 
 ## Installing
 
-With [uv](https://docs.astral.sh/uv/), there is nothing to install: `uvx` fetches the importer and its dependency and runs it.
+With [uv](https://docs.astral.sh/uv/), there is nothing to install: `uvx` fetches the importer and its dependencies and runs it.
 
 ```sh
 uvx --from git+https://github.com/tommasoturchi/granola-to-humla granola-to-humla --help
@@ -31,8 +31,8 @@ The steps below write `granola-to-humla` for whichever of these you used.
 
 ## Usage
 
-1. Launch Humla at least once so it creates its database, then quit it (Humla > Quit). The script refuses to run while Humla is open.
-2. Preview the import:
+1. Launch Humla at least once so it creates its database, then quit it with Cmd+Q or Quit from its menu-bar icon (closing the window leaves it running). The importer refuses to run while Humla is open.
+2. Preview the import. This prints a summary and the first few meetings, and writes nothing:
 
    ```sh
    granola-to-humla ~/Downloads/granola-export-*.csv --dry-run
@@ -41,7 +41,7 @@ The steps below write `granola-to-humla` for whichever of these you used.
 3. Import:
 
    ```sh
-   granola-to-humla ~/Downloads/granola-export-*.csv --folder Granola
+   granola-to-humla ~/Downloads/granola-export-*.csv
    ```
 
    It shows the same summary and asks before writing. Add `--yes` to skip the question, for example in a script.
@@ -70,9 +70,9 @@ Granola's notes are Markdown. The script parses them with markdown-it-py, which 
 | Option | Effect |
 | --- | --- |
 | `--dry-run` | Print counts and a sample; write nothing. |
-| `--folder NAME` | File imported notes in this Humla folder, created if it doesn't exist. |
-| `--update` | Refresh notes from an earlier import with the CSV's content. Notes you have edited in Humla since importing are left alone. |
-| `--overwrite-edited` | With `--update`, overwrite those edited notes too. |
+| `--folder NAME` | File imported notes in this Humla folder, created if it doesn't exist. Decide at import time; see Known quirks. |
+| `--update` | Refresh notes from an earlier import with the CSV's content. Notes changed in Humla since the import are left alone; that includes moving them to another folder. |
+| `--overwrite-edited` | With `--update`, overwrite those changed notes too. |
 | `--language CODE` | Each note's language. `detect` (the default) reads it from the transcript, see below. `auto` leaves every note on Humla's auto-detect, a code such as `en` or `it` gives all of them that language, and `default` follows Humla's app-wide setting. |
 | `--strip-granola-links` | Remove the "Chat with meeting transcript: <granola link>" footer Granola appends to every summary. Kept by default. |
 | `--limit N` | Import only the first N documents, for a trial. |
@@ -99,6 +99,8 @@ Each note's updated time is set to the meeting date, so imported meetings sort b
 ## Known quirks
 
 Humla reads a line that starts with up to 40 characters followed by a colon and a space as a speaker label. Granola sometimes breaks a line mid-sentence, so a line such as `and then she said: we ship on Friday` gets picked up as a speaker called "and then she said" in Humla's speaker filters. In one export of 226 meetings this affected 18 of them. The transcript text itself is imported unchanged.
+
+Moving an imported note to another folder, or deleting the folder it sits in, makes Humla stamp the note with the current time. The note then moves up in lists sorted by last change, and a later `--update` treats it as changed by you. If you don't want the notes in a folder, leave out `--folder` when importing rather than removing the folder afterwards.
 
 ## Undo
 

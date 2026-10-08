@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "granola-to-humla"
 dynamic = ["version"]
 description = "Import a Granola CSV export into the Humla meeting-notes app"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Tommaso Turchi" }]
 requires-python = ">=3.11"
 dependencies = [
@@ -18,7 +19,6 @@ dependencies = [
 ]
 classifiers = [
     "Environment :: Console",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
 ]
