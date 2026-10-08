@@ -29,11 +29,11 @@ Quit Humla before running. The script refuses to run while the app is open,
 and by default takes a consistent backup of notes.sqlite first.
 
 Usage:
-    python3 granola_to_humla.py granola-export.csv --dry-run
-    python3 granola_to_humla.py granola-export.csv
-    python3 granola_to_humla.py granola-export-*.csv --folder Granola
-    python3 granola_to_humla.py granola-export.csv --update
-    python3 granola_to_humla.py granola-export.csv --language en
+    granola-to-humla granola-export.csv --dry-run
+    granola-to-humla granola-export.csv
+    granola-to-humla granola-export-*.csv --folder Granola
+    granola-to-humla granola-export.csv --update
+    granola-to-humla granola-export.csv --language en
 
 Each note's language is detected from its transcript by counting common
 function words (see detect_language); a transcript that is short, mixed or in
@@ -46,7 +46,7 @@ setup or in Settings, which is why the script doesn't leave it to that setting.
 Re-running is safe. Note ids are derived from Granola's document_id, so a
 document that is already in Humla is skipped (or refreshed with --update).
 
-Standard library only; Python 3.9+.
+Needs Python 3.9+ and markdown-it-py.
 """
 
 from __future__ import annotations
@@ -54,13 +54,22 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import html
 import re
 import sqlite3
 import subprocess
 import sys
 import uuid
 from pathlib import Path
+
+try:
+    from markdown_it import MarkdownIt
+    from markdown_it.token import Token
+except ImportError:  # pragma: no cover
+    sys.exit(
+        "granola_to_humla needs markdown-it-py. Install it with\n"
+        "    python3 -m pip install markdown-it-py\n"
+        "or run the importer with uvx, which installs it for you (see the README)."
+    )
 
 __version__ = "1.0.0"
 
@@ -241,226 +250,89 @@ def detect_language(text: str) -> str | None:
 # --------------------------------------------------------------------------
 # Markdown -> Tiptap HTML (for the user's own notes)
 #
-# Humla's notes editor is Tiptap with StarterKit (headings 1-4, lists, bold,
-# italic, strike, inline code, code blocks, blockquotes, rules). It has no Link
-# extension, so a link would be dropped to its label on load: links are written
-# as "label (url)" text instead, which keeps the URL visible and searchable.
-# Output follows the shape Tiptap itself serialises (<li><p>…</p></li>, no
-# whitespace between tags) so the editor loads it without normalising it.
+# Parsed with markdown-it-py (CommonMark, so two-space nested bullets nest the
+# way Granola writes them), then shaped for Humla's notes editor: Tiptap with
+# StarterKit, which has headings 1-4, lists, bold, italic, strike, inline
+# code, code blocks, blockquotes and rules, and no links or images. A link
+# would lose its address on load, so links and images become "label (url)"
+# text. Output follows the shape Tiptap itself serialises (<li><p>...</p></li>,
+# no whitespace between tags) so the editor loads it without normalising it.
 # --------------------------------------------------------------------------
 
-_LIST_RE = re.compile(r"^( *)([-*+]|\d{1,9}[.)])(?:[ \t]+(.*))?$")
-_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
-_HR_RE = re.compile(r"^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([^`\s]*)")
-_QUOTE_RE = re.compile(r"^ {0,3}>[ ]?(.*)$")
-_LINK_RE = re.compile(r"\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
-_AUTOLINK_RE = re.compile(r"<((?:https?|mailto):[^>\s]+)>")
-_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
-_CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
-_TOKEN_RE = re.compile("\ue000(\\d+)\ue001")
+_MD = MarkdownIt("commonmark", {"breaks": True, "html": False}).enable("strikethrough")
 
 
-def _esc(text: str) -> str:
-    # Matches what ProseMirror's serializer escapes in text nodes.
-    return html.escape(text, quote=False)
+def _text_token(content: str) -> Token:
+    token = Token("text", "", 0)
+    token.content = content
+    return token
 
 
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _dedent(line: str, n: int) -> str:
-    return line[min(n, _indent(line)):]
-
-
-def _is_list_item(line: str) -> bool:
-    return bool(_LIST_RE.match(line)) and not _HR_RE.match(line)
-
-
-def _starts_block(line: str) -> bool:
-    return bool(
-        _HEADING_RE.match(line)
-        or _HR_RE.match(line)
-        or _FENCE_RE.match(line)
-        or _QUOTE_RE.match(line)
-        or _is_list_item(line)
-    )
-
-
-def render_inline(text: str) -> str:
-    tokens: list[str] = []
-
-    def stash(fragment: str) -> str:
-        tokens.append(fragment)
-        return f"\ue000{len(tokens) - 1}\ue001"
-
-    def link(label: str, url: str) -> str:
-        shown = url[len("mailto:"):] if url.lower().startswith("mailto:") else url
-        label = label.strip()
-        if not label or label == url or label == shown:
-            return stash(_esc(shown))
-        return stash(f"{render_inline(label)} ({_esc(shown)})")
-
-    text = _CODE_SPAN_RE.sub(lambda m: stash(f"<code>{_esc(m.group(2).strip())}</code>"), text)
-    text = _ESCAPE_RE.sub(lambda m: stash(_esc(m.group(1))), text)
-    text = _LINK_RE.sub(lambda m: link(m.group(1), m.group(2)), text)
-    text = _AUTOLINK_RE.sub(lambda m: link("", m.group(1)), text)
-    text = _esc(text)
-    text = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<strong>\1</strong>", text)
-    text = re.sub(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)", r"<strong>\1</strong>", text)
-    text = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<s>\1</s>", text)
-    text = re.sub(r"(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])", r"<em>\1</em>", text)
-    text = re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", r"<em>\1</em>", text)
-    while "\ue000" in text:
-        text = _TOKEN_RE.sub(lambda m: tokens[int(m.group(1))], text)
-    return text
-
-
-def _parse_list(lines: list[str], i: int):
-    first = _LIST_RE.match(lines[i])
-    base = len(first.group(1))
-    ordered = first.group(2)[0].isdigit()
-    start = int(first.group(2)[:-1]) if ordered else 1
-    items: list[list] = []
-
-    def sibling(line: str) -> bool:
-        m = _LIST_RE.match(line)
-        return bool(m) and not _HR_RE.match(line) and len(m.group(1)) == base and m.group(2)[0].isdigit() == ordered
-
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip():
-            j = i
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and sibling(lines[j]):
-                i = j
-                continue
-            break
-        if not sibling(line):
-            break
-        m = _LIST_RE.match(line)
-        marker = m.group(2)
-        content = m.group(3) or ""
-        after = line[base + len(marker):]
-        gap = len(after) - len(after.lstrip(" \t"))
-        if not content or gap > 4:
-            gap = 1
-        content_indent = base + len(marker) + gap
-        item_lines = [content]
-        i += 1
-        while i < len(lines):
-            cur = lines[i]
-            if not cur.strip():
-                j = i
-                while j < len(lines) and not lines[j].strip():
-                    j += 1
-                if j < len(lines) and _indent(lines[j]) > base:
-                    item_lines.extend([""] * (j - i))
-                    i = j
-                    continue
-                break
-            if _indent(cur) > base:
-                item_lines.append(_dedent(cur, content_indent))
-                i += 1
-                continue
-            if _starts_block(cur):
-                break
-            item_lines.append(cur.strip())  # lazy continuation of the item's paragraph
-            i += 1
-        items.append(parse_blocks(item_lines))
-    return ("list", ordered, start, items), i
-
-
-def parse_blocks(lines: list[str]) -> list:
-    blocks: list = []
+def _flatten_links(children: list[Token]) -> list[Token]:
+    out: list[Token] = []
     i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip():
-            i += 1
+    while i < len(children):
+        token = children[i]
+        if token.type == "link_open":
+            href = str(token.attrGet("href") or "")
+            shown = href[len("mailto:"):] if href.lower().startswith("mailto:") else href
+            j = i + 1
+            while j < len(children) and children[j].type != "link_close":
+                j += 1
+            label = children[i + 1 : j]
+            label_text = "".join(t.content for t in label if t.type in ("text", "code_inline")).strip()
+            out.extend(label)
+            if not label_text:
+                out.append(_text_token(shown))
+            elif label_text not in (href, shown):
+                out.append(_text_token(f" ({shown})"))
+            i = j + 1
             continue
-        fence = _FENCE_RE.match(line)
-        if fence:
-            closer, lang = fence.group(1), fence.group(2)
-            body: list[str] = []
-            i += 1
-            while i < len(lines) and not lines[i].strip().startswith(closer):
-                body.append(lines[i])
-                i += 1
-            i += 1
-            blocks.append(("code", lang, "\n".join(body)))
-            continue
-        heading = _HEADING_RE.match(line)
-        if heading:
-            blocks.append(("h", min(len(heading.group(1)), 4), heading.group(2)))
-            i += 1
-            continue
-        if _HR_RE.match(line):
-            blocks.append(("hr",))
-            i += 1
-            continue
-        if _QUOTE_RE.match(line):
-            quoted: list[str] = []
-            while i < len(lines) and lines[i].strip():
-                q = _QUOTE_RE.match(lines[i])
-                quoted.append(q.group(1) if q else lines[i].strip())
-                i += 1
-            blocks.append(("quote", parse_blocks(quoted)))
-            continue
-        if _is_list_item(line):
-            block, i = _parse_list(lines, i)
-            blocks.append(block)
-            continue
-        para = [line.strip()]
+        if token.type == "image":
+            src = str(token.attrGet("src") or "")
+            out.append(_text_token(f"{token.content} ({src})" if token.content else src))
+        else:
+            out.append(token)
         i += 1
-        while i < len(lines) and lines[i].strip() and not _starts_block(lines[i]):
-            para.append(lines[i].strip())
-            i += 1
-        blocks.append(("p", para))
-    return blocks
+    return out
 
 
-def render_blocks(blocks: list) -> str:
-    out: list[str] = []
-    for block in blocks:
-        kind = block[0]
-        if kind == "p":
-            out.append("<p>" + "<br>".join(render_inline(l) for l in block[1]) + "</p>")
-        elif kind == "h":
-            out.append(f"<h{block[1]}>{render_inline(block[2])}</h{block[1]}>")
-        elif kind == "hr":
-            out.append("<hr>")
-        elif kind == "code":
-            cls = f' class="language-{_esc(block[1])}"' if block[1] else ""
-            out.append(f"<pre><code{cls}>{_esc(block[2])}</code></pre>")
-        elif kind == "quote":
-            inner = render_blocks(block[1])
-            if inner:
-                out.append(f"<blockquote>{inner}</blockquote>")
-        elif kind == "list":
-            _, ordered, start, items = block
-            rendered = []
-            for item in items:
-                if not item:
-                    continue  # an empty bullet ("-") carries nothing
-                inner = render_blocks(item)
-                if item[0][0] != "p":
-                    inner = "<p></p>" + inner  # Tiptap list items open with a paragraph
-                rendered.append(f"<li>{inner}</li>")
-            if rendered:
-                tag = "ol" if ordered else "ul"
-                attrs = f' start="{start}"' if ordered and start != 1 else ""
-                out.append(f"<{tag}{attrs}>{''.join(rendered)}</{tag}>")
-    return "".join(out)
+def _shape_for_tiptap(tokens: list[Token]) -> list[Token]:
+    shaped: list[Token] = []
+    for i, token in enumerate(tokens):
+        # An empty bullet ("-" on its own line) carries nothing.
+        if token.type == "list_item_open" and i + 1 < len(tokens) and tokens[i + 1].type == "list_item_close":
+            continue
+        if token.type == "list_item_close" and i > 0 and tokens[i - 1].type == "list_item_open":
+            continue
+        if token.type == "paragraph_open" or token.type == "paragraph_close":
+            token.hidden = False  # tight lists hide them; Tiptap wants <li><p>
+        if token.type in ("heading_open", "heading_close") and token.tag in ("h5", "h6"):
+            token.tag = "h4"
+        if token.type == "inline" and token.children:
+            token.children = _flatten_links(token.children)
+        shaped.append(token)
+    # A list left with no items at all goes too.
+    out: list[Token] = []
+    for token in shaped:
+        if token.type in ("bullet_list_close", "ordered_list_close") and out and out[-1].type == token.type.replace("_close", "_open"):
+            out.pop()
+            continue
+        out.append(token)
+    return out
 
 
 def markdown_to_tiptap(markdown: str) -> str:
-    text = markdown.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4)
+    text = markdown.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         return ""
-    return render_blocks(parse_blocks(text.split("\n")))
+    env: dict = {}
+    tokens = _shape_for_tiptap(_MD.parse(text, env))
+    rendered = _MD.renderer.render(tokens, _MD.options, env)
+    rendered = rendered.replace("<br />\n", "<br>").replace("\n</code></pre>", "</code></pre>")
+    # Drop the newlines markdown-it puts between tags. Text never contains a
+    # literal "<" or ">" (they are escaped), so this only touches markup.
+    return re.sub(r">\n(?=<)", ">", rendered).strip()
 
 
 # --------------------------------------------------------------------------

@@ -8,19 +8,26 @@ This is an independent project, not affiliated with Granola or Humla.
 
 - macOS with Humla installed and opened at least once.
 - Python 3.9 or newer. The `python3` that comes with Xcode's command line tools is fine.
+- [markdown-it-py](https://github.com/executablebooks/markdown-it-py), the one dependency. Both ways of running the importer below install it for you.
 - A Granola CSV export with the columns `document_id`, `document_title`, `document_created`, `summary`, `notes` and `transcript`. The script stops with a clear message if any are missing.
 
-The importer is one file that uses only Python's standard library. Download it:
+## Installing
+
+With [uv](https://docs.astral.sh/uv/), there is nothing to install: `uvx` fetches the importer and its dependency and runs it.
 
 ```sh
-curl -O https://raw.githubusercontent.com/tommasoturchi/granola-to-humla/main/granola_to_humla.py
+uvx --from git+https://github.com/tommasoturchi/granola-to-humla granola-to-humla --help
 ```
 
-or run it from GitHub with [uv](https://docs.astral.sh/uv/), without keeping a copy:
+Without uv, install it into a virtual environment of its own:
 
 ```sh
-uvx --from git+https://github.com/tommasoturchi/granola-to-humla granola-to-humla granola-export.csv --dry-run
+python3 -m venv ~/.granola-to-humla
+~/.granola-to-humla/bin/pip install git+https://github.com/tommasoturchi/granola-to-humla
+~/.granola-to-humla/bin/granola-to-humla --help
 ```
+
+The steps below write `granola-to-humla` for whichever of these you used.
 
 ## Usage
 
@@ -28,13 +35,13 @@ uvx --from git+https://github.com/tommasoturchi/granola-to-humla granola-to-huml
 2. Preview the import:
 
    ```sh
-   python3 granola_to_humla.py ~/Downloads/granola-export-*.csv --dry-run
+   granola-to-humla ~/Downloads/granola-export-*.csv --dry-run
    ```
 
 3. Import:
 
    ```sh
-   python3 granola_to_humla.py ~/Downloads/granola-export-*.csv --folder Granola
+   granola-to-humla ~/Downloads/granola-export-*.csv --folder Granola
    ```
 
 4. Open Humla. On launch it indexes the new notes for search and chat (see below).
@@ -54,7 +61,7 @@ Before writing anything the script saves a consistent copy of the database next 
 
 `user_email` and `workspace_name` are not used. Notes land in your Personal space, which in Humla is local-only.
 
-Granola's notes are Markdown; the script converts headings, nested bullet and numbered lists, bold, italics, strikethrough, inline code, code blocks, quotes and rules to the HTML Humla's editor uses. Humla's editor has no link support, so a link is written as `label (url)` to keep the address visible and searchable. Summaries stay Markdown because that is what Humla renders them from.
+Granola's notes are Markdown. The script parses them with markdown-it-py, which follows the CommonMark standard, so two-space nested bullets nest the way Granola writes them, and converts headings, nested bullet and numbered lists, bold, italics, strikethrough, inline code, code blocks, quotes and rules to the HTML Humla's editor uses. Humla's editor has no links or images, so both are written as `label (url)` to keep the address visible and searchable, and headings below level 4 become level 4, the smallest the editor has. Summaries stay Markdown because that is what Humla renders them from.
 
 ## Options
 
@@ -113,8 +120,11 @@ Don't skip the move. If Humla was killed rather than quit, its most recent chang
 
 ## Tests
 
+From a clone of this repository:
+
 ```sh
-python3 -m unittest test_granola_to_humla
+python3 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/python -m unittest test_granola_to_humla
 ```
 
 The importer was also checked against Humla's own Rust database code (`src-tauri/src/db.rs` from version 0.65.2, unchanged in 0.66.0, compiled into a small harness): its schema and migrations open the imported database, its startup backfill indexes every imported note, keyword search returns hits from transcripts, summaries and notes, and every transcript and summary matches the CSV text exactly, apart from surrounding whitespace.

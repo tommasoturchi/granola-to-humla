@@ -45,17 +45,23 @@ class MarkdownToTiptap(unittest.TestCase):
     def test_headings_clamp_to_the_editors_levels(self):
         self.assertEqual(g.markdown_to_tiptap("## Two\n###### Six"), "<h2>Two</h2><h4>Six</h4>")
 
-    def test_links_keep_their_url_as_text(self):
-        # Humla's editor has no Link extension, so <a> would lose the URL.
-        self.assertEqual(g.render_inline("[paper](https://x.org/p)"), "paper (https://x.org/p)")
-        self.assertEqual(g.render_inline("[https://x.org](https://x.org)"), "https://x.org")
-        self.assertEqual(g.render_inline("[a@b.c](mailto:a@b.c)"), "a@b.c")
+    def test_links_and_images_keep_their_url_as_text(self):
+        # Humla's editor has no links or images, so <a>/<img> would lose the URL.
+        md = g.markdown_to_tiptap
+        self.assertEqual(md("[paper](https://x.org/p)"), "<p>paper (https://x.org/p)</p>")
+        self.assertEqual(md("[https://x.org](https://x.org)"), "<p>https://x.org</p>")
+        self.assertEqual(md("[a@b.c](mailto:a@b.c)"), "<p>a@b.c</p>")
+        self.assertEqual(md("<https://q.r>"), "<p>https://q.r</p>")
+        self.assertEqual(md("![chart](https://x.org/c.png)"), "<p>chart (https://x.org/c.png)</p>")
 
     def test_inline_marks_and_escaping(self):
         self.assertEqual(
-            g.render_inline("**b** *i* ~~s~~ `x<y` a & b snake_case 2 * 3"),
-            "<strong>b</strong> <em>i</em> <s>s</s> <code>x&lt;y</code> a &amp; b snake_case 2 * 3",
+            g.markdown_to_tiptap("**b** *i* ~~s~~ `x<y` a & b snake_case 2 * 3"),
+            "<p><strong>b</strong> <em>i</em> <s>s</s> <code>x&lt;y</code> a &amp; b snake_case 2 * 3</p>",
         )
+
+    def test_raw_html_is_shown_as_text(self):
+        self.assertEqual(g.markdown_to_tiptap("<b>hi</b>"), "<p>&lt;b&gt;hi&lt;/b&gt;</p>")
 
     def test_soft_breaks_inside_a_paragraph_are_kept(self):
         self.assertEqual(g.markdown_to_tiptap("line one\nline two"), "<p>line one<br>line two</p>")
