@@ -9,8 +9,13 @@ description = "Import a Granola CSV export into the Humla meeting-notes app"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Tommaso Turchi" }]
-requires-python = ">=3.9"
-dependencies = ["markdown-it-py>=3"]
+requires-python = ">=3.11"
+dependencies = [
+    "markdown-it-py>=3",
+    "py3langid>=0.4",
+    "rich>=13.7",
+    "typer>=0.15.4",
+]
 classifiers = [
     "Environment :: Console",
     "License :: OSI Approved :: MIT License",

@@ -35,9 +35,9 @@ Usage:
     granola-to-humla granola-export.csv --update
     granola-to-humla granola-export.csv --language en
 
-Each note's language is detected from its transcript by counting common
-function words (see detect_language); a transcript that is short, mixed or in
-a language the lists don't cover gets "auto". Humla writes in that language
+Each note's language is detected from its transcript with py3langid, voting
+over 100-word stretches (see detect_language); a transcript that is short or
+mixed gets "auto". Humla writes in that language
 when you press Summarize on an imported note or ask it for a new title, and
 its MCP server reports it so a connected agent knows which language to search
 in. Humla's app-wide language is Norwegian unless you chose another during
@@ -46,29 +46,36 @@ setup or in Settings, which is why the script doesn't leave it to that setting.
 Re-running is safe. Note ids are derived from Granola's document_id, so a
 document that is already in Humla is skipped (or refreshed with --update).
 
-Needs Python 3.9+ and markdown-it-py.
+Needs Python 3.11+ and the dependencies listed in pyproject.toml.
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 import datetime as dt
+import functools
 import re
 import sqlite3
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated, Optional
 
 try:
+    import py3langid
+    import typer
     from markdown_it import MarkdownIt
     from markdown_it.token import Token
-except ImportError:  # pragma: no cover
+    from py3langid.langid import MODEL_FILE, LanguageIdentifier
+    from rich.console import Console
+    from rich.markup import escape
+    from rich.table import Table
+except ImportError as missing:  # pragma: no cover
     sys.exit(
-        "granola_to_humla needs markdown-it-py. Install it with\n"
-        "    python3 -m pip install markdown-it-py\n"
-        "or run the importer with uvx, which installs it for you (see the README)."
+        f"granola_to_humla needs the {missing.name} package. Run it with uvx, or install it with "
+        "pip, which bring its dependencies along (see the README)."
     )
 
 __version__ = "1.0.0"
@@ -89,6 +96,13 @@ REQUIRED_NOTE_COLUMNS = {"id", "title", "body", "transcript", "summary", "create
 # Matches the main app binary inside the bundle, not the read-only humla-mcp
 # server that MCP clients keep running.
 APP_PROCESS_PATTERN = r"/Contents/MacOS/[Hh]umla( |$)"
+
+EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+
+class ImportFailed(Exception):
+    """A problem the user can fix. Reported as a message, without a traceback."""
+
 
 GRANOLA_FOOTER_RE = re.compile(
     r"\n*(?:-{3,}|\*{3,}|_{3,})\s*\n+\s*Chat with meeting transcript:\s*\S.*\s*\Z",
@@ -121,9 +135,9 @@ def read_granola_csv(paths: list[Path]) -> list[dict[str, str]]:
             reader = csv.DictReader(fh)
             missing = [c for c in REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
             if missing:
-                sys.exit(
-                    f"{path}: not a Granola CSV export (missing column(s): {', '.join(missing)}).\n"
-                    f"Found: {', '.join(reader.fieldnames or [])}"
+                raise ImportFailed(
+                    f"{path} is not a Granola CSV export: it has no {', '.join(missing)} column. "
+                    f"Its columns are: {', '.join(reader.fieldnames or [])}."
                 )
             for row in reader:
                 doc_id = (row.get("document_id") or "").strip()
@@ -134,32 +148,16 @@ def read_granola_csv(paths: list[Path]) -> list[dict[str, str]]:
     return rows
 
 
-_ISO_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?\s*(Z|[+-]\d{2}:?\d{2})?$"
-)
-
-
 def parse_created(value: str) -> int:
-    """Granola's ISO-8601 timestamp -> epoch milliseconds.
-
-    Hand-parsed because Python 3.9's fromisoformat rejects the trailing `Z`
-    and fractional seconds that aren't exactly 3 or 6 digits.
-    """
-    m = _ISO_RE.match(value.strip())
-    if not m:
-        raise ValueError(f"unrecognised timestamp {value!r}")
-    year, month, day, hour, minute = (int(m.group(i)) for i in range(1, 6))
-    second = int(m.group(6) or 0)
-    micro = int(((m.group(7) or "") + "000000")[:6])
-    tz_raw = m.group(8)
-    if tz_raw in (None, "Z"):
-        tz = dt.timezone.utc
-    else:
-        sign = 1 if tz_raw[0] == "+" else -1
-        digits = tz_raw[1:].replace(":", "")
-        tz = dt.timezone(sign * dt.timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
-    stamp = dt.datetime(year, month, day, hour, minute, second, micro, tzinfo=tz)
-    return int(stamp.timestamp() * 1000)
+    """Granola's ISO-8601 timestamp -> epoch milliseconds. A timestamp without
+    an offset is read as UTC, which is what Granola writes."""
+    try:
+        stamp = dt.datetime.fromisoformat(value.strip())
+    except ValueError:
+        raise ValueError(f"unrecognised timestamp {value!r}") from None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return (stamp - EPOCH) // dt.timedelta(milliseconds=1)
 
 
 def clean_transcript(text: str) -> str:
@@ -185,66 +183,55 @@ def note_id_for(document_id: str) -> str:
 # --------------------------------------------------------------------------
 # Language detection (--language detect, the default)
 #
-# Counts common function words per language. Only words that belong to a
-# single language's list count, so "de", "la" or "en", which several
-# languages share, never tip the balance; that is also what separates
-# Norwegian from Danish ("hva", "litt", "mye" against "hvad", "lidt",
-# "meget"). Codes are the ones Humla's language picker uses.
-#
-# A note gets a language only when the evidence is clear: at least
-# DETECT_MIN_HITS marker words, at least DETECT_MIN_SHARE of them from one
-# language. Short, mixed or unlisted-language transcripts stay on "auto".
+# py3langid (a maintained fork of langid.py) names the language of a piece of
+# text, restricted here to the languages Humla's picker offers, so whatever it
+# returns is a code Humla knows. On a whole transcript it is always certain,
+# even when a meeting switches language halfway, so each transcript is cut
+# into stretches of DETECT_CHUNK_WORDS words, every stretch is classified, and
+# a language wins only if it covers DETECT_MIN_SHARE of the words. A short,
+# mixed or unclear transcript stays on "auto".
 # --------------------------------------------------------------------------
 
-_FUNCTION_WORDS = {
-    "en": "the and that this with have but not they what just about know think yeah there would "
-          "because don't it's i'm we're you're can't should could which their been were "
-          "really something actually also",
-    "it": "il che non per sono della del anche questo questa quindi perché però cioè allora gli "
-          "una più poi ho hai abbiamo fare molto tutto essere cosa dove nel alla delle dei ci "
-          "magari comunque adesso ancora le qui",
-    "es": "el los las pero porque para por está muy también esto eso cuando hay pues "
-          "entonces bueno yo creo puede hacer sólo ahora del una cosa",
-    "fr": "le les des est une pas je vous nous qui dans pour avec sur mais c'est ça donc voilà "
-          "très aussi elle ils au aux du peut fait faire il non",
-    "de": "der die das und ist nicht ich sie ein eine zu den mit auf für auch dass wir aber noch "
-          "sehr oder wenn wie haben sind schon jetzt du also",
-    "pt": "os não uma para com mas você isso isto então também eu ele ela muito tem na ao foi "
-          "bem aqui fazer das",
-    "nl": "het een van dat niet ik je op voor maar ook dan zijn nog wel heel dus hebben gewoon "
-          "eigenlijk nu",
-    "sv": "och att är inte jag ett ska vad hur också där väldigt göra varit riktigt den nu",
-    "no": "ikke jeg hva kanskje litt mye noe ble sånn veldig gjøre vært riktig nå",
-    "da": "ikke jeg hvad måske lidt meget noget blev sådan rigtig gøre været nu",
-}
+# The languages in Humla's picker: Whisper's set (src/lib/languages.ts in Humla).
+HUMLA_LANGUAGES = frozenset(
+    """
+    af sq am ar hy as az ba eu be bn bs br bg my yue ca zh hr cs da nl en et fo fi
+    fr gl ka de el gu ht ha haw he hi hu is id it ja jw kn kk km ko lo la lv ln lt
+    lb mk mg ms ml mt mi mr mn ne no nn oc ps fa pl pt pa ro ru sa sr sn sd si sk
+    sl so es su sw sv tl tg ta tt te th bo tr tk uk ur uz vi cy yi yo
+    """.split()
+)
+_LANGID_TO_HUMLA = {"jv": "jw"}  # Javanese: py3langid says jv, Whisper says jw
 
-
-def _marker_words() -> dict[str, str]:
-    seen: dict[str, set[str]] = {}
-    for lang, words in _FUNCTION_WORDS.items():
-        for word in words.split():
-            seen.setdefault(word, set()).add(lang)
-    return {word: langs.pop() for word, langs in seen.items() if len(langs) == 1}
-
-
-LANGUAGE_MARKERS = _marker_words()
-DETECT_MIN_HITS = 20
+DETECT_CHUNK_WORDS = 100
+DETECT_MIN_WORDS = 50
 DETECT_MIN_SHARE = 0.75
-_WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+
+
+@functools.lru_cache(maxsize=1)
+def _language_identifier() -> LanguageIdentifier:
+    identifier = LanguageIdentifier.from_modelpath(Path(py3langid.__file__).parent / MODEL_FILE)
+    identifier.set_languages(
+        [code for code in identifier.nb_classes if _LANGID_TO_HUMLA.get(code, code) in HUMLA_LANGUAGES]
+    )
+    return identifier
 
 
 def detect_language(text: str) -> str | None:
     """The language code of `text`, or None when the evidence isn't clear."""
-    hits: dict[str, int] = {}
-    for word in _WORD_RE.findall(text.lower().replace("’", "'")):
-        lang = LANGUAGE_MARKERS.get(word)
-        if lang:
-            hits[lang] = hits.get(lang, 0) + 1
-    total = sum(hits.values())
-    if total < DETECT_MIN_HITS:
+    words = text.split()
+    if len(words) < DETECT_MIN_WORDS:
         return None
-    lang, top = max(hits.items(), key=lambda kv: kv[1])
-    return lang if top / total >= DETECT_MIN_SHARE else None
+    identifier = _language_identifier()
+    votes: dict[str, int] = {}
+    for start in range(0, len(words), DETECT_CHUNK_WORDS):
+        chunk = words[start : start + DETECT_CHUNK_WORDS]
+        lang, _score = identifier.classify(" ".join(chunk))
+        votes[lang] = votes.get(lang, 0) + len(chunk)
+    lang, covered = max(votes.items(), key=lambda kv: kv[1])
+    if covered / len(words) < DETECT_MIN_SHARE:
+        return None
+    return _LANGID_TO_HUMLA.get(lang, lang)
 
 
 # --------------------------------------------------------------------------
@@ -353,10 +340,9 @@ def humla_is_running() -> bool:
 def open_humla_db(data_dir: Path) -> sqlite3.Connection:
     db_path = data_dir / DB_FILE
     if not db_path.is_file():
-        sys.exit(
-            f"No Humla database at {db_path}.\n"
-            "Launch Humla once so it creates its database, quit it, then run this again "
-            "(or point --data-dir at the folder that holds notes.sqlite)."
+        raise ImportFailed(
+            f"There is no Humla database at {db_path}. Open Humla once so it creates one, quit it, "
+            "and run this again, or point --data-dir at the folder that holds notes.sqlite."
         )
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -368,9 +354,9 @@ def note_columns(conn: sqlite3.Connection) -> set[str]:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(notes)")}
     missing = REQUIRED_NOTE_COLUMNS - cols
     if missing:
-        sys.exit(
-            "This database doesn't look like a Humla notes database "
-            f"(notes table is missing: {', '.join(sorted(missing))})."
+        raise ImportFailed(
+            "This doesn't look like a Humla database: its notes table has no "
+            f"{', '.join(sorted(missing))} column."
         )
     return cols
 
@@ -435,19 +421,49 @@ def drop_derived_index(conn: sqlite3.Connection, note_id: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def build_note(row: dict[str, str], args) -> dict:
+@dataclass
+class Options:
+    csv_files: list[Path]
+    data_dir: Path = DEFAULT_DATA_DIR
+    dry_run: bool = False
+    folder: Optional[str] = None
+    update: bool = False
+    overwrite_edited: bool = False
+    language: str = "detect"
+    strip_granola_links: bool = False
+    limit: Optional[int] = None
+    no_backup: bool = False
+    yes: bool = False
+    allow_running: bool = False
+
+
+@dataclass
+class Plan:
+    documents: int
+    to_insert: list[dict] = field(default_factory=list)
+    to_update: list[dict] = field(default_factory=list)
+    already_imported: list[dict] = field(default_factory=list)
+    edited_in_humla: list[dict] = field(default_factory=list)
+    bad_dates: list[str] = field(default_factory=list)
+
+    @property
+    def to_write(self) -> list[dict]:
+        return self.to_insert + self.to_update
+
+
+def build_note(row: dict[str, str], opts: Options) -> dict:
     created = parse_created(row["document_created"])
     note = {
         "id": note_id_for(row["document_id"]),
         "title": " ".join((row.get("document_title") or "").split()),
         "body": markdown_to_tiptap(row.get("notes") or ""),
         "transcript": clean_transcript(row.get("transcript") or ""),
-        "summary": clean_summary(row.get("summary") or "", args.strip_granola_links),
+        "summary": clean_summary(row.get("summary") or "", opts.strip_granola_links),
         "created_at": created,
         "updated_at": created,
-        "language": args.language,
+        "language": opts.language,
     }
-    if args.language == "detect":
+    if opts.language == "detect":
         # The transcript is what was said. Granola sometimes writes the summary
         # in another language, so it only stands in when there is no transcript.
         text = note["transcript"] or "\n".join((row.get("summary") or "", row.get("notes") or ""))
@@ -455,121 +471,36 @@ def build_note(row: dict[str, str], args) -> dict:
     return note
 
 
-def parse_language(value: str) -> str:
-    """--language: "detect" (per note, see detect_language), "auto", "default"
-    (stored as "", Humla's own fallback to the app-wide language setting), or a
-    language code as Humla's picker uses them (ISO 639-1, plus a few
-    three-letter Whisper codes such as "haw" and "yue")."""
-    code = value.strip().lower()
-    if code == "default":
-        return ""
-    if code in ("detect", "auto") or re.fullmatch(r"[a-z]{2,3}", code):
-        return code
-    raise argparse.ArgumentTypeError(
-        f"{value!r}: use detect, auto, default, or a language code such as en or it"
-    )
-
-
-def describe_language(code: str, notes: list[dict]) -> str:
-    if code == "detect":
-        counts: dict[str, int] = {}
-        for n in notes:
-            counts[n["language"]] = counts.get(n["language"], 0) + 1
-        parts = ", ".join(f"{lang} {k}" for lang, k in sorted(counts.items(), key=lambda kv: -kv[1]))
-        return f"detected per note ({parts})" if parts else "detected per note"
-    if code == "auto":
-        return "auto-detect"
-    return code or "Humla's default language setting"
-
-
-def run(args) -> int:
-    paths = [Path(p).expanduser() for p in args.csv]
-    for p in paths:
-        if not p.is_file():
-            sys.exit(f"No such file: {p}")
-    rows = read_granola_csv(paths)
-    if args.limit:
-        rows = rows[: args.limit]
-
-    notes, bad = [], []
+def plan_import(opts: Options, rows: list[dict[str, str]], conn: sqlite3.Connection, cols: set[str]) -> Plan:
+    plan = Plan(documents=len(rows))
+    notes = []
     for row in rows:
         try:
-            notes.append(build_note(row, args))
+            notes.append(build_note(row, opts))
         except ValueError as e:
-            bad.append(f"{row.get('document_title') or row['document_id']}: {e}")
+            plan.bad_dates.append(f"{row.get('document_title') or row['document_id']}: {e}")
     notes.sort(key=lambda n: n["created_at"])
-
-    data_dir = Path(args.data_dir).expanduser()
-    if not args.dry_run and humla_is_running() and not args.allow_running:
-        sys.exit(
-            "Humla is running. Quit it first (Humla > Quit), then run this again.\n"
-            "It only indexes newly imported notes for search when it starts."
-        )
-
-    conn = open_humla_db(data_dir)
-    cols = note_columns(conn)
-    existing = {
-        r["id"]: r
-        for r in conn.execute(
-            "SELECT id, created_at, updated_at, "
-            + ("deleted_at" if "deleted_at" in cols else "NULL AS deleted_at")
-            + " FROM notes"
-        )
-    }
-
-    to_insert = [n for n in notes if n["id"] not in existing]
-    to_update, skipped_present, skipped_edited = [], [], []
+    existing = {r["id"]: r for r in conn.execute("SELECT id, created_at, updated_at FROM notes")}
     for n in notes:
         prior = existing.get(n["id"])
         if prior is None:
-            continue
-        if not args.update:
-            skipped_present.append(n)
-        elif prior["updated_at"] != prior["created_at"] and not args.overwrite_edited:
+            plan.to_insert.append(n)
+        elif not opts.update:
+            plan.already_imported.append(n)
+        elif prior["updated_at"] != prior["created_at"] and not opts.overwrite_edited:
             # The importer writes updated_at = created_at; anything else means
             # the note was edited in Humla since.
-            skipped_edited.append(n)
+            plan.edited_in_humla.append(n)
         else:
-            to_update.append(n)
+            plan.to_update.append(n)
+    return plan
 
-    with_body = sum(1 for n in to_insert + to_update if n["body"])
-    print(f"Granola documents read: {len(rows)} from {len(paths)} file(s)")
-    print(f"Humla database:         {data_dir / DB_FILE}")
-    print(f"  new notes:            {len(to_insert)}")
-    if args.update:
-        print(f"  refreshed:            {len(to_update)}")
-        if skipped_edited:
-            print(f"  kept (edited in Humla since import): {len(skipped_edited)}")
-    elif skipped_present:
-        print(f"  already imported:     {len(skipped_present)} (skipped; --update refreshes them)")
-    print(f"  with your own notes:  {with_body}")
-    print(f"  note language:        {describe_language(args.language, to_insert + to_update)}")
-    for msg in bad:
-        print(f"  skipped, bad date:    {msg}")
 
-    if args.dry_run:
-        print("\nDry run, nothing written. First few:")
-        for n in (to_insert + to_update)[:8]:
-            when = dt.datetime.fromtimestamp(n["created_at"] / 1000).strftime("%Y-%m-%d %H:%M")
-            print(
-                f"  {when}  {n['title'][:48]:<48}  transcript {len(n['transcript'].splitlines()):>5} lines"
-                f"  summary {len(n['summary']):>5} chars  notes {'yes' if n['body'] else 'no':<3}"
-                f"  language {n['language'] or 'default'}"
-            )
-        conn.close()
-        return 0
-
-    if not to_insert and not to_update:
-        print("\nNothing to write.")
-        conn.close()
-        return 0
-
-    if not args.no_backup:
-        print(f"\nBackup: {backup_db(conn, data_dir)}")
-
+def write_import(plan: Plan, opts: Options, conn: sqlite3.Connection, cols: set[str]) -> Optional[bool]:
+    """Write the plan in one transaction. Returns whether the folder was created
+    (None without --folder)."""
     summary_preset = (setting(conn, "default_summary_preset") or "").strip() or "meeting"
-    now = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-
+    now = (dt.datetime.now(dt.timezone.utc) - EPOCH) // dt.timedelta(milliseconds=1)
     optional_defaults = {
         "audio_path": None,
         "summary_preset": summary_preset,
@@ -583,82 +514,266 @@ def run(args) -> int:
         "detected_language": None,
         "speakers": "",  # derived by Humla's indexer on next launch
     }
+    folder_created = None
+    with conn:  # one transaction: all or nothing
+        folder_id = None
+        if opts.folder:
+            folder_id, folder_created = ensure_folder(conn, opts.folder, now)
+        for n in plan.to_insert:
+            values = dict(n)
+            if "language" not in cols:
+                del values["language"]
+            for col, default in optional_defaults.items():
+                if col in cols:
+                    values[col] = default
+            if folder_id and "folder_id" in cols:
+                values["folder_id"] = folder_id
+            names = list(values)
+            conn.execute(
+                f"INSERT INTO notes ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
+                [values[c] for c in names],
+            )
+        for n in plan.to_update:
+            conn.execute(
+                "UPDATE notes SET title = ?, body = ?, transcript = ?, summary = ?, "
+                "created_at = ?, updated_at = ? WHERE id = ?",
+                (n["title"], n["body"], n["transcript"], n["summary"], n["created_at"], n["updated_at"], n["id"]),
+            )
+            if "language" in cols:
+                conn.execute("UPDATE notes SET language = ? WHERE id = ?", (n["language"], n["id"]))
+            drop_derived_index(conn, n["id"])
+            if folder_id and "folder_id" in cols:
+                conn.execute("UPDATE notes SET folder_id = ? WHERE id = ? AND folder_id IS NULL", (folder_id, n["id"]))
+    return folder_created
 
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+console = Console(highlight=False)
+err_console = Console(stderr=True, highlight=False)
+
+
+def _show_path(path: Path) -> str:
     try:
-        with conn:  # one transaction: all or nothing
-            folder_id = None
-            if args.folder:
-                folder_id, created = ensure_folder(conn, args.folder, now)
-                print(f"Folder: {args.folder}" + (" (created)" if created else ""))
+        return escape("~/" + str(path.relative_to(Path.home())))
+    except ValueError:
+        return escape(str(path))
 
-            for n in to_insert:
-                values = dict(n)
-                if "language" not in cols:
-                    del values["language"]
-                for col, default in optional_defaults.items():
-                    if col in cols:
-                        values[col] = default
-                if folder_id and "folder_id" in cols:
-                    values["folder_id"] = folder_id
-                names = list(values)
-                conn.execute(
-                    f"INSERT INTO notes ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
-                    [values[c] for c in names],
-                )
 
-            for n in to_update:
-                conn.execute(
-                    "UPDATE notes SET title = ?, body = ?, transcript = ?, summary = ?, "
-                    "created_at = ?, updated_at = ? WHERE id = ?",
-                    (n["title"], n["body"], n["transcript"], n["summary"], n["created_at"], n["updated_at"], n["id"]),
-                )
-                if "language" in cols:
-                    conn.execute("UPDATE notes SET language = ? WHERE id = ?", (n["language"], n["id"]))
-                drop_derived_index(conn, n["id"])
-                if folder_id and "folder_id" in cols:
-                    conn.execute("UPDATE notes SET folder_id = ? WHERE id = ? AND folder_id IS NULL", (folder_id, n["id"]))
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def describe_language(opts: Options, notes: list[dict]) -> str:
+    if opts.language == "detect":
+        counts: dict[str, int] = {}
+        for n in notes:
+            counts[n["language"]] = counts.get(n["language"], 0) + 1
+        parts = ", ".join(f"{lang} {k}" for lang, k in sorted(counts.items(), key=lambda kv: -kv[1]))
+        return f"detected per note: {parts}" if parts else "detected per note"
+    if opts.language == "auto":
+        return "auto-detect for every note"
+    return f"{opts.language} for every note" if opts.language else "Humla's default language setting"
+
+
+def show_plan(plan: Plan, opts: Options) -> None:
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold", no_wrap=True)
+    grid.add_column(overflow="fold")
+    grid.add_row("Granola export", f"{_plural(plan.documents, 'meeting')} in {_plural(len(opts.csv_files), 'file')}")
+    grid.add_row("Humla library", _show_path(opts.data_dir / DB_FILE))
+    grid.add_row("New notes", str(len(plan.to_insert)))
+    if opts.update:
+        grid.add_row("Refreshed", str(len(plan.to_update)))
+        if plan.edited_in_humla:
+            grid.add_row("Kept as they are", f"{len(plan.edited_in_humla)} (edited in Humla since the import)")
+    elif plan.already_imported:
+        grid.add_row("Already imported", f"{len(plan.already_imported)} (skipped; --update refreshes them)")
+    grid.add_row("With your own notes", str(sum(1 for n in plan.to_write if n["body"])))
+    grid.add_row("Language", describe_language(opts, plan.to_write))
+    if opts.folder:
+        grid.add_row("Folder", escape(opts.folder))
+    for msg in plan.bad_dates:
+        grid.add_row("[red]Skipped[/red]", escape(msg))
+    console.print(grid)
+
+
+def show_sample(plan: Plan, rows: int = 8) -> None:
+    table = Table(title=f"First {min(rows, len(plan.to_write))} of {len(plan.to_write)}", title_justify="left")
+    table.add_column("Date")
+    table.add_column("Title", overflow="ellipsis", no_wrap=True, max_width=48)
+    table.add_column("Transcript", justify="right")
+    table.add_column("Summary", justify="right")
+    table.add_column("Notes")
+    table.add_column("Language")
+    for n in plan.to_write[:rows]:
+        table.add_row(
+            dt.datetime.fromtimestamp(n["created_at"] / 1000).strftime("%Y-%m-%d %H:%M"),
+            escape(n["title"]),
+            f"{len(n['transcript'].splitlines())} lines",
+            f"{len(n['summary'])} chars",
+            "yes" if n["body"] else "no",
+            n["language"] or "default",
+        )
+    console.print(table)
+
+
+def run_import(opts: Options) -> int:
+    with console.status("Reading the Granola export…"):
+        rows = read_granola_csv(opts.csv_files)
+        if opts.limit:
+            rows = rows[: opts.limit]
+    if not opts.dry_run and humla_is_running() and not opts.allow_running:
+        raise ImportFailed(
+            "Humla is running. Quit it first (Cmd+Q, or Quit from its menu-bar icon), then run this "
+            "again. Humla only indexes newly imported notes for search when it starts."
+        )
+    conn = open_humla_db(opts.data_dir)
+    try:
+        cols = note_columns(conn)
+        with console.status("Converting notes and detecting languages…"):
+            plan = plan_import(opts, rows, conn, cols)
+        show_plan(plan, opts)
+
+        if opts.dry_run:
+            if plan.to_write:
+                console.print()
+                show_sample(plan)
+            console.print("\n[bold]Dry run[/bold]: nothing was written.")
+            return 0
+        if not plan.to_write:
+            console.print("\nNothing to write.")
+            return 0
+
+        console.print()
+        if not opts.yes:
+            if not sys.stdin.isatty():
+                raise ImportFailed("Not running in a terminal, so I can't ask before writing. Add --yes to import without asking.")
+            if not typer.confirm(f"Write {_plural(len(plan.to_write), 'note')} to Humla?", default=False):
+                console.print("Nothing written.")
+                return 1
+        if not opts.no_backup:
+            backup = backup_db(conn, opts.data_dir)
+            console.print(f"Backup: {_show_path(backup)}", soft_wrap=True)
+        folder_created = write_import(plan, opts, conn, cols)
     finally:
         conn.close()
 
-    print(f"\nImported {len(to_insert)} note(s)" + (f", refreshed {len(to_update)}" if to_update else "") + ".")
-    print("Open Humla: it indexes the new notes for search and chat as it starts.")
+    done = f"Imported {_plural(len(plan.to_insert), 'note')}"
+    if plan.to_update:
+        done += f", refreshed {len(plan.to_update)}"
+    if opts.folder:
+        done += f" into {'a new' if folder_created else 'the'} {escape(opts.folder)} folder"
+    console.print(f"[green]{done}.[/green]")
+    console.print("Open Humla: it indexes the new notes for search and chat as it starts.")
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Import a Granola CSV export into Humla.",
-        epilog="Quit Humla before importing. Imported notes land in your Personal space.",
+def _language_option(value: str) -> str:
+    """--language: "detect", "auto", "default" (stored as "", Humla's fallback
+    to its app-wide setting), or a code as Humla's picker uses them."""
+    code = value.strip().lower()
+    if code == "default":
+        return ""
+    if code in ("detect", "auto") or code in HUMLA_LANGUAGES:
+        return code
+    raise typer.BadParameter("use detect, auto, default, or a language code from Humla's list, such as en or it")
+
+
+def _version_option(value: bool) -> None:
+    if value:
+        console.print(f"granola-to-humla {__version__}")
+        raise typer.Exit()
+
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+
+@app.command(
+    help="Import a Granola CSV export into Humla.",
+    epilog="Quit Humla first. Imported notes land in your Personal space, and a backup of your "
+    "library is saved before anything is written.",
+)
+def cli(
+    csv_files: Annotated[
+        list[Path],
+        typer.Argument(
+            metavar="EXPORT.csv", help="Granola export CSV file(s).", exists=True, dir_okay=False, show_default=False
+        ),
+    ],
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would be imported; write nothing.")] = False,
+    folder: Annotated[
+        Optional[str], typer.Option(metavar="NAME", help="File the imported notes in this folder, created if missing.")
+    ] = None,
+    language: Annotated[
+        str,
+        typer.Option(
+            metavar="CODE",
+            callback=_language_option,
+            help="Each note's language: [bold]detect[/bold] it from the transcript (auto when unclear), "
+            "[bold]auto[/bold] for all, a code such as [bold]en[/bold] or [bold]it[/bold] for all, "
+            "or [bold]default[/bold] to follow Humla's setting.",
+        ),
+    ] = "detect",
+    update: Annotated[
+        bool, typer.Option("--update", help="Refresh notes from an earlier import; ones you edited in Humla are kept.")
+    ] = False,
+    overwrite_edited: Annotated[
+        bool, typer.Option("--overwrite-edited", help="With --update, overwrite the edited ones too.")
+    ] = False,
+    strip_granola_links: Annotated[
+        bool,
+        typer.Option(
+            "--strip-granola-links", help='Drop the "Chat with meeting transcript" link Granola adds to summaries.'
+        ),
+    ] = False,
+    limit: Annotated[
+        Optional[int], typer.Option(metavar="N", min=1, help="Import only the first N meetings, for a trial.")
+    ] = None,
+    data_dir: Annotated[
+        Path,
+        typer.Option(help="Humla's data folder.", file_okay=False, show_default="~/Library/Application Support/no.humla.app"),
+    ] = DEFAULT_DATA_DIR,
+    no_backup: Annotated[bool, typer.Option("--no-backup", help="Skip the backup of your Humla library.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask before writing.")] = False,
+    allow_running: Annotated[bool, typer.Option("--allow-running", hidden=True)] = False,
+    version: Annotated[
+        Optional[bool],
+        typer.Option("--version", callback=_version_option, is_eager=True, help="Show the version and exit."),
+    ] = None,
+) -> None:
+    opts = Options(
+        csv_files=csv_files,
+        data_dir=data_dir.expanduser(),
+        dry_run=dry_run,
+        folder=folder,
+        update=update,
+        overwrite_edited=overwrite_edited,
+        language=language,
+        strip_granola_links=strip_granola_links,
+        limit=limit,
+        no_backup=no_backup,
+        yes=yes,
+        allow_running=allow_running,
     )
-    parser.add_argument("csv", nargs="+", help="Granola export CSV file(s)")
-    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help=f"Humla data folder (default: {DEFAULT_DATA_DIR})")
-    parser.add_argument("--dry-run", action="store_true", help="show what would be imported, write nothing")
-    parser.add_argument("--folder", metavar="NAME", help="file the imported notes in this folder (created if missing)")
-    parser.add_argument("--update", action="store_true", help="refresh notes imported by an earlier run")
-    parser.add_argument(
-        "--overwrite-edited",
-        action="store_true",
-        help="with --update, also overwrite notes you have edited in Humla since importing",
-    )
-    parser.add_argument(
-        "--strip-granola-links",
-        action="store_true",
-        help='drop the "Chat with meeting transcript: <granola link>" footer from summaries',
-    )
-    parser.add_argument(
-        "--language",
-        type=parse_language,
-        default="detect",
-        metavar="CODE",
-        help="each note's language: detect (default; from its transcript, auto when unclear), "
-        "auto, a code such as en or it, or default (Humla's own setting)",
-    )
-    parser.add_argument("--limit", type=int, metavar="N", help="import only the first N documents (for a trial run)")
-    parser.add_argument("--no-backup", action="store_true", help="skip the database backup")
-    parser.add_argument("--allow-running", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    return run(parser.parse_args(argv))
+    try:
+        code = run_import(opts)
+    except ImportFailed as e:
+        err_console.print(f"[red]{escape(str(e))}[/red]")
+        raise typer.Exit(1) from None
+    raise typer.Exit(code)
+
+
+def main() -> None:
+    app(prog_name="granola-to-humla")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

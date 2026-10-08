@@ -7,8 +7,8 @@ This is an independent project, not affiliated with Granola or Humla.
 ## Requirements
 
 - macOS with Humla installed and opened at least once.
-- Python 3.9 or newer. The `python3` that comes with Xcode's command line tools is fine.
-- [markdown-it-py](https://github.com/executablebooks/markdown-it-py), the one dependency. Both ways of running the importer below install it for you.
+- Python 3.11 or newer. uv downloads one for you if needed; the `python3` that comes with Xcode's command line tools (3.9) is too old.
+- Four packages, which both ways of running the importer below install for you: [markdown-it-py](https://github.com/executablebooks/markdown-it-py) for the notes, [py3langid](https://github.com/adbar/py3langid) for language detection, and [Typer](https://typer.tiangolo.com) and [Rich](https://github.com/Textualize/rich) for the command line.
 - A Granola CSV export with the columns `document_id`, `document_title`, `document_created`, `summary`, `notes` and `transcript`. The script stops with a clear message if any are missing.
 
 ## Installing
@@ -19,7 +19,7 @@ With [uv](https://docs.astral.sh/uv/), there is nothing to install: `uvx` fetche
 uvx --from git+https://github.com/tommasoturchi/granola-to-humla granola-to-humla --help
 ```
 
-Without uv, install it into a virtual environment of its own:
+Without uv, install it into a virtual environment of its own, using Python 3.11 or newer (from [python.org](https://www.python.org/downloads/) or Homebrew):
 
 ```sh
 python3 -m venv ~/.granola-to-humla
@@ -44,9 +44,11 @@ The steps below write `granola-to-humla` for whichever of these you used.
    granola-to-humla ~/Downloads/granola-export-*.csv --folder Granola
    ```
 
+   It shows the same summary and asks before writing. Add `--yes` to skip the question, for example in a script.
+
 4. Open Humla. On launch it indexes the new notes for search and chat (see below).
 
-Before writing anything the script saves a consistent copy of the database next to it, as `notes.sqlite.before-granola-import-<timestamp>`.
+Before writing anything the importer saves a consistent copy of the database next to it, as `notes.sqlite.before-granola-import-<timestamp>`.
 
 ## What goes where
 
@@ -76,6 +78,7 @@ Granola's notes are Markdown. The script parses them with markdown-it-py, which 
 | `--limit N` | Import only the first N documents, for a trial. |
 | `--data-dir PATH` | Humla's data folder. Default: `~/Library/Application Support/no.humla.app`. |
 | `--no-backup` | Skip the database backup. |
+| `--yes`, `-y` | Don't ask before writing. Needed when the importer doesn't run in a terminal. |
 
 Running the script twice does not duplicate anything. Each note's id is derived from its Granola `document_id`, so documents already imported are skipped, and a newer export with extra meetings imports only the new ones.
 
@@ -87,7 +90,7 @@ Humla normally builds a note's transcript from per-recording timelines with spea
 
 Search chunks, the speaker list and embeddings are derived data that Humla maintains itself. At startup it indexes every note that has no chunks yet, then embeds them with whatever embedding provider you have configured. The importer leaves all of that to Humla instead of reimplementing its chunker. If your chat provider is OpenAI, the first launch after the import sends the imported text through `text-embedding-3-small` once, on your API key.
 
-Each note's language is detected from its transcript, by counting common function words in English, Italian, Spanish, French, German, Portuguese, Dutch, Swedish, Norwegian and Danish. Only words that belong to one of those languages count, so a word like `de` or `la` that several of them share never tips the balance. A note gets a language when at least 20 such words turn up and three quarters of them point the same way; a transcript that is short, mixed or in another language stays on `auto`. In a test export of 226 meetings that gave 120 Italian, 103 English and 3 mixed.
+Each note's language is detected from its transcript with [py3langid](https://github.com/adbar/py3langid), limited to the languages Humla's picker offers, so every code it stores is one Humla knows. On a whole transcript py3langid is always certain, even when a meeting switches language halfway, so the importer cuts each transcript into stretches of 100 words, classifies each one, and gives the note a language only if it covers at least three quarters of the words. A short or mixed transcript stays on `auto`. On a test export of 226 meetings that gave 121 Italian, 103 English and 2 mixed.
 
 The language doesn't change the imported text. Humla writes in it when you press Summarize on an imported note or ask for a new title, and its MCP server reports it, so a connected agent knows which language to search in. Humla's app-wide language is Norwegian unless you picked another during setup or in Settings, which is why imported notes get their own language instead of following that setting.
 

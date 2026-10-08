@@ -6,7 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import typer
+from typer.testing import CliRunner
+
 import granola_to_humla as g
+
+RUNNER = CliRunner()
 
 
 class MarkdownToTiptap(unittest.TestCase):
@@ -109,13 +114,19 @@ class LanguageDetection(unittest.TestCase):
                 self.assertEqual(g.detect_language(" ".join([text] * 3)), lang)
 
     def test_unclear_text_gets_no_language(self):
-        self.assertIsNone(g.detect_language(SAMPLES["it"]))  # too short
-        self.assertIsNone(g.detect_language(" ".join([SAMPLES["it"], SAMPLES["en"]] * 3)))  # mixed
+        self.assertIsNone(g.detect_language(" ".join(SAMPLES["it"].split()[:30])))  # too short
+        half_and_half = " ".join([SAMPLES["it"]] * 4 + [SAMPLES["en"]] * 4)
+        self.assertIsNone(g.detect_language(half_and_half))
         self.assertIsNone(g.detect_language(""))
 
-    def test_markers_belong_to_one_language_only(self):
-        for word in ("de", "la", "en", "non", "il", "con", "ikke", "jeg"):
-            self.assertNotIn(word, g.LANGUAGE_MARKERS)
+    def test_a_meeting_mostly_in_one_language_gets_it(self):
+        mostly_italian = " ".join([SAMPLES["it"]] * 9 + [SAMPLES["en"]])
+        self.assertEqual(g.detect_language(mostly_italian), "it")
+
+    def test_only_codes_from_humlas_picker(self):
+        self.assertIn("no", g.HUMLA_LANGUAGES)
+        self.assertNotIn("auto", g.HUMLA_LANGUAGES)
+        self.assertEqual(len(g.HUMLA_LANGUAGES), 100)
 
 
 class Fields(unittest.TestCase):
@@ -124,15 +135,20 @@ class Fields(unittest.TestCase):
         self.assertEqual(g.parse_created("2026-09-14T16:28:28.349+02:00"), 1789396108349)
         self.assertEqual(g.parse_created("2026-09-14T14:28:28Z"), 1789396108000)
 
+    def test_timestamps_without_an_offset_are_utc(self):
+        self.assertEqual(g.parse_created("2026-09-14T14:28:28.349"), 1789396108349)
+        with self.assertRaises(ValueError):
+            g.parse_created("14/09/2026")
+
     def test_language_option(self):
-        self.assertEqual(g.parse_language("detect"), "detect")
-        self.assertEqual(g.parse_language("auto"), "auto")
-        self.assertEqual(g.parse_language(" EN "), "en")
-        self.assertEqual(g.parse_language("yue"), "yue")
-        self.assertEqual(g.parse_language("default"), "")
-        for bad in ("english", "e", "en-US", ""):
-            with self.assertRaises(g.argparse.ArgumentTypeError):
-                g.parse_language(bad)
+        self.assertEqual(g._language_option("detect"), "detect")
+        self.assertEqual(g._language_option("auto"), "auto")
+        self.assertEqual(g._language_option(" EN "), "en")
+        self.assertEqual(g._language_option("yue"), "yue")
+        self.assertEqual(g._language_option("default"), "")
+        for bad in ("english", "xx", "en-US", ""):
+            with self.assertRaises(typer.BadParameter):
+                g._language_option(bad)
 
     def test_note_ids_are_stable(self):
         a = g.note_id_for("0b5e7a52-6d1c-4f3e-9a8d-2c7f1e4b9d10")
@@ -180,8 +196,11 @@ class EndToEnd(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_import(self, *extra):
-        return g.main([str(self.csv), "--data-dir", str(self.dir), "--no-backup", *extra])
+    def run_import(self, *extra, ok=True):
+        result = RUNNER.invoke(g.app, [str(self.csv), "--data-dir", str(self.dir), "--no-backup", *extra])
+        if ok:
+            self.assertEqual(result.exit_code, 0, result.output)
+        return result
 
     def rows(self):
         conn = sqlite3.connect(self.dir / "notes.sqlite")
@@ -191,7 +210,7 @@ class EndToEnd(unittest.TestCase):
         return out
 
     def test_fields_land_in_the_right_columns(self):
-        self.run_import("--folder", "Granola")
+        self.run_import("--yes", "--folder", "Granola")
         n = self.rows()["Standup"]
         self.assertEqual(n["body"], "<ul><li><p>send the slides</p></li></ul>")
         self.assertEqual(n["transcript"], "Hello.\nHi there.")
@@ -204,24 +223,35 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.rows()["Planning"]["language"], "en")
 
     def test_language_can_be_set_and_refreshed(self):
-        self.run_import("--language", "en")
+        self.run_import("--yes", "--language", "en")
         self.assertEqual(self.rows()["Standup"]["language"], "en")
-        self.run_import("--update", "--language", "default")
+        self.run_import("--yes", "--update", "--language", "default")
         self.assertEqual(self.rows()["Standup"]["language"], "")
-        self.run_import("--update", "--language", "auto")
+        self.run_import("--yes", "--update", "--language", "auto")
         self.assertEqual(self.rows()["Planning"]["language"], "auto")
 
+    def test_dry_run_writes_nothing(self):
+        result = self.run_import("--dry-run")
+        self.assertIn("Dry run", result.output)
+        self.assertEqual(self.rows(), {})
+
+    def test_it_asks_before_writing_and_wont_guess_without_a_terminal(self):
+        result = self.run_import(ok=False)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("--yes", result.output)
+        self.assertEqual(self.rows(), {})
+
     def test_rerun_is_a_no_op_and_update_spares_edited_notes(self):
-        self.run_import()
+        self.run_import("--yes")
         conn = sqlite3.connect(self.dir / "notes.sqlite")
         conn.execute("UPDATE notes SET body = '<p>mine</p>', updated_at = updated_at + 1 WHERE title = 'Standup'")
         conn.commit()
         conn.close()
-        self.run_import()
+        self.run_import("--yes")
         self.assertEqual(len(self.rows()), 3)
-        self.run_import("--update")
+        self.run_import("--yes", "--update")
         self.assertEqual(self.rows()["Standup"]["body"], "<p>mine</p>")
-        self.run_import("--update", "--overwrite-edited")
+        self.run_import("--yes", "--update", "--overwrite-edited")
         self.assertEqual(self.rows()["Standup"]["body"], "<ul><li><p>send the slides</p></li></ul>")
 
 
